@@ -1,42 +1,51 @@
+# app/main.py
 from fastapi import FastAPI
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
+import pandas as pd
 
 # Vector store
 from langchain_community.vectorstores import Chroma
 
-# ✅ Quick win 1: imports mis à jour (lib dédiée Ollama)
+# Ollama (LangChain)
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 
 load_dotenv()
+
 app = FastAPI(
     title="Project Copilot API",
     version="0.1.0",
     description="RAG local (Ollama) : /ask répond à partir des docs indexés + sources."
 )
 
-# === Config ===
+# === Config (.env) ===
 VECTORSTORE_DIR = os.getenv("VECTORSTORE_DIR", "vectorstore")
 EMBED_MODEL     = os.getenv("EMBEDDINGS_MODEL", "nomic-embed-text")
-LLM_MODEL       = os.getenv("LLM_MODEL", "llama3:8b")
+LLM_MODEL       = os.getenv("LLM_MODEL", "mistral:latest")
+DATA_DIR        = os.path.join(os.getcwd(), "data")  # pour /digest
 
 # === Chargement du store + retriever ===
+# IMPORTANT : la collection doit matcher celle de l’ingestion ("copilot")
 embeddings = OllamaEmbeddings(model=EMBED_MODEL)
-vs = Chroma(persist_directory=VECTORSTORE_DIR, embedding_function=embeddings)
+vs = Chroma(
+    persist_directory=VECTORSTORE_DIR,
+    embedding_function=embeddings,
+    collection_name="copilot"
+)
 
-# ✅ Quick win 2: retriever MMR (diversité des passages)
+# Retriever MMR (diversité des passages)
 retriever = vs.as_retriever(
     search_type="mmr",
     search_kwargs={"k": 8, "fetch_k": 25, "lambda_mult": 0.5}
 )
 
-# ✅ Quick win 2: LLM paramétré pour réponses factuelles et concises
+# LLM paramétré (réponses courtes, factuelles)
 llm = ChatOllama(
     model=LLM_MODEL,
-    num_ctx=8192,      # plus grand contexte = moins de coupures
-    temperature=0.2,   # plus factuel
-    num_predict=256,   # réponses concises
+    num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "8192")),
+    temperature=float(os.getenv("OLLAMA_TEMPERATURE", "0.2")),
+    num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "256")),
 )
 
 class AskPayload(BaseModel):
@@ -48,8 +57,8 @@ SYSTEM = (
     "Style: concis, factuel. Ajoute les sources (nom de fichier) en fin de réponse."
 )
 
-# ✅ Quick win 3: seuil de confiance — si trop peu de sources pertinentes trouvées
-CONFIDENCE_MIN_SOURCES = 1  # Mets 2 quand tu auras plus de documents
+# Seuil de confiance — si trop peu de sources pertinentes trouvées
+CONFIDENCE_MIN_SOURCES = 1  # passe à 2 quand tu auras plus de docs
 
 @app.post("/ask")
 def ask(payload: AskPayload):
@@ -75,13 +84,64 @@ def ask(payload: AskPayload):
     prompt = f"{SYSTEM}\n\nContexte:\n{context}\n\nQuestion: {question}\nRéponse:"
 
     # 4) Appel LLM (Ollama local)
-    answer = llm.invoke(prompt)
+    msg = llm.invoke(prompt)
+    answer_text = getattr(msg, "content", str(msg))
 
     return {
-        "answer": answer,
+        "answer": answer_text,
         "sources": sources,
         "meta": {"confidence": "normal", "retrieved": len(docs), "model": LLM_MODEL}
     }
+
+@app.get("/digest")
+def digest():
+    """
+    KPIs simples à partir de data/tickets.csv + synthèse LLM.
+    """
+    tickets_csv = os.path.join(DATA_DIR, "tickets.csv")
+    if not os.path.isfile(tickets_csv):
+        return {"kpis": {}, "summary": "Aucun data/tickets.csv trouvé."}
+
+    df = pd.read_csv(tickets_csv)
+
+    total = len(df)
+    open_count = int((df["status"] == "open").sum()) if "status" in df.columns else None
+    closed_count = int((df["status"] == "closed").sum()) if "status" in df.columns else None
+    critical_open = []
+    if all(c in df.columns for c in ["status","severity","id"]):
+        critical_open = df[(df["status"]=="open") & (df["severity"]=="critical")]["id"].astype(str).tolist()
+
+    # Durée moyenne de résolution (si dates dispo)
+    avg_resolution = None
+    if all(c in df.columns for c in ["created_at","closed_at","status"]):
+        closed_df = df[df["status"]=="closed"].copy()
+        if not closed_df.empty:
+            closed_df["created_at"] = pd.to_datetime(closed_df["created_at"], errors="coerce")
+            closed_df["closed_at"] = pd.to_datetime(closed_df["closed_at"], errors="coerce")
+            closed_df["resolution_days"] = (closed_df["closed_at"] - closed_df["created_at"]).dt.days
+            try:
+                avg_resolution = float(closed_df["resolution_days"].dropna().mean())
+            except Exception:
+                avg_resolution = None
+
+    kpis = {
+        "total_tickets": int(total),
+        "open": open_count,
+        "closed": closed_count,
+        "critical_open_ids": critical_open,
+        "avg_resolution_days": avg_resolution
+    }
+
+    # Synthèse LLM
+    summary_prompt = (
+        "Synthétise en 5 bullets clairs l'état des tickets ci-dessous : "
+        "points de vigilance, et propose 3 priorités d'action.\n\n"
+        f"KPIs: {kpis}"
+    )
+    msg = llm.invoke(summary_prompt)
+    summary_text = getattr(msg, "content", str(msg))
+
+    return {"kpis": kpis, "summary": summary_text}
 
 @app.get("/")
 def root():

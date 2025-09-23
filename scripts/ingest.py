@@ -1,64 +1,69 @@
+# scripts/ingest.py
 import os
 from dotenv import load_dotenv
+
+from langchain_community.document_loaders import (
+    TextLoader, PyPDFLoader, UnstructuredMarkdownLoader, DirectoryLoader
+)
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain_ollama import OllamaEmbeddings
 
 load_dotenv()
 
-DATA_DIR = "data/docs"
+# --- Config ---
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DOCS_DIR = os.path.join(DATA_DIR, "docs")
 VECTORSTORE_DIR = os.getenv("VECTORSTORE_DIR", "vectorstore")
-USE_OLLAMA = os.getenv("USE_OLLAMA", "0") in ("1", "true", "True")
-EMB_MODEL = os.getenv("EMBEDDINGS_MODEL") or ("nomic-embed-text" if USE_OLLAMA else "text-embedding-3-small")
+EMBED_MODEL = os.getenv("EMBEDDINGS_MODEL", "nomic-embed-text")
+COLLECTION_NAME = "copilot"
 
-def load_docs():
+def load_all_docs():
     docs = []
-    if not os.path.exists(DATA_DIR):
-        print(f"⚠️ Dossier {DATA_DIR} introuvable.")
-        return docs
-    files = os.listdir(DATA_DIR)
-    print(f"📁 Fichiers trouvés : {files}")
-    for file in files:
-        path = os.path.join(DATA_DIR, file)
-        if file.lower().endswith((".txt", ".md")):
-            print(f"→ Chargement texte : {file}")
-            docs.extend(TextLoader(path, encoding="utf-8").load())
-        elif file.lower().endswith(".pdf"):
-            print(f"→ Chargement PDF : {file}")
-            docs.extend(PyPDFLoader(path).load())
-        else:
-            print(f"↷ Ignoré : {file}")
-    print(f"📄 Documents chargés : {len(docs)}")
+
+    # 1) .txt à la racine de data/ (facultatif)
+    if os.path.isdir(DATA_DIR):
+        loader_txt = DirectoryLoader(DATA_DIR, glob="*.txt", loader_cls=TextLoader, show_progress=True)
+        docs += loader_txt.load()
+
+    # 2) data/docs/ : .md, .pdf, .txt
+    if os.path.isdir(DOCS_DIR):
+        loader_md  = DirectoryLoader(DOCS_DIR, glob="**/*.md",  loader_cls=UnstructuredMarkdownLoader, show_progress=True)
+        loader_pdf = DirectoryLoader(DOCS_DIR, glob="**/*.pdf", loader_cls=PyPDFLoader,                 show_progress=True)
+        loader_tx2 = DirectoryLoader(DOCS_DIR, glob="**/*.txt", loader_cls=TextLoader,                  show_progress=True)
+        docs += loader_md.load() + loader_pdf.load() + loader_tx2.load()
+
     return docs
 
-def chunk_and_store(docs):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-    splits = splitter.split_documents(docs)
-    print(f"🧩 Chunks générés : {len(splits)}")
-    if not splits:
-        print("⚠️ Aucun chunk à indexer (fichiers vides ?).")
+def main():
+    print(f"📁 DATA_DIR: {DATA_DIR}")
+    print(f"📁 DOCS_DIR: {DOCS_DIR}")
+    print(f"💾 VECTORSTORE_DIR: {VECTORSTORE_DIR}")
+    print(f"🧠 EMBEDDINGS_MODEL (Ollama): {EMBED_MODEL}")
+
+    # Embeddings 100% locaux via Ollama
+    embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+
+    raw_docs = load_all_docs()
+    print(f"📄 Documents chargés : {len(raw_docs)}")
+
+    if not raw_docs:
+        print("⚠️ Aucun document trouvé. Ajoute des fichiers dans data/ ou data/docs/")
         return
 
-    if USE_OLLAMA:
-        print(f"🧠 Embeddings (Ollama) : {EMB_MODEL}")
-        embeddings = OllamaEmbeddings(model=EMB_MODEL)
-    else:
-        print(f"🧠 Embeddings (OpenAI) : {EMB_MODEL}")
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        if not api_key or api_key.endswith("XXXX"):
-            print("❌ OPENAI_API_KEY manquante. Passe en USE_OLLAMA=1 ou ajoute une clé.")
-            return
-        embeddings = OpenAIEmbeddings(model=EMB_MODEL)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    chunks = splitter.split_documents(raw_docs)
+    print(f"🧩 Chunks générés : {len(chunks)}")
 
-    db = Chroma.from_documents(splits, embeddings, persist_directory=VECTORSTORE_DIR)
-    db.persist()
-    print(f"✅ {len(splits)} chunks stockés dans {VECTORSTORE_DIR}")
+    vs = Chroma.from_documents(
+        chunks,
+        embedding=embeddings,
+        persist_directory=VECTORSTORE_DIR,
+        collection_name=COLLECTION_NAME
+    )
+    vs.persist()
+    print(f"✅ Ingestion OK : {len(chunks)} chunks indexés dans '{VECTORSTORE_DIR}' (collection '{COLLECTION_NAME}').")
 
 if __name__ == "__main__":
-    docs = load_docs()
-    if docs:
-        chunk_and_store(docs)
-    else:
-        print("⚠️ Aucun document trouvé.")
+    main()

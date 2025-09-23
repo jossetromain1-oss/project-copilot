@@ -1,0 +1,2 @@
+Project Copilot est un assistant IA qui résume les tickets et répond aux questions sur la documentation.
+Il utilise un système RAG pour retrouver l’info pertinente et fournir des réponses sourcées.
